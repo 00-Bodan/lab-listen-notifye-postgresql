@@ -1,36 +1,41 @@
-# Experimento mínimo: llenar LISTEN/NOTIFY
+# PostgreSQL LISTEN/NOTIFY: A Minimal Queue Experiment
 
-Requisito: Docker con Compose. Ejecuta los comandos desde esta carpeta.
-Usamos PostgreSQL 17 con una cola de 64 páginas (512 KiB con páginas de 8 KiB).
-No publica puertos ni necesita Python.
+Watch PostgreSQL's notification queue fill up, reject new notifications, and
+recover once a listener ends its open transaction.
 
-Validado con PostgreSQL 17.11: uso inicial `0`, cola llena `1` con errores
-`too many notifications in the NOTIFY queue`, y uso `0` tras el `COMMIT` del
-listener. El siguiente envío funcionó.
+**Requirements:** Docker with Compose. Run the commands from this directory.
+The lab uses PostgreSQL 17 with a 64-page queue (512 KiB with 8 KiB pages).
+It does not publish ports or require Python.
 
-## 1. Arrancar
+Validated with PostgreSQL 17.11: initial queue usage was `0`, a full queue
+reported `1` and produced `too many notifications in the NOTIFY queue` errors,
+and usage returned to `0` after the listener's `COMMIT`. The next send succeeded.
+
+Read the [full experiment and results](Resultado.md) for a detailed explanation.
+
+## 1. Start PostgreSQL
 
 ```sh
 docker compose up -d --wait
 ```
 
-## 2. Terminal A: retener la cola
+## 2. Terminal A: Hold the Queue
 
 ```sh
 docker compose exec postgres psql -X -U postgres
 ```
 
-Ejecuta por separado y deja esta sesión abierta:
+Execute these statements separately and leave the session open:
 
 ```sql
 LISTEN demo;
 BEGIN;
 ```
 
-`LISTEN` queda confirmado antes de abrir la transacción. Mientras esta siga
-abierta, el listener no puede avanzar y retiene las notificaciones pendientes.
+`LISTEN` commits before the transaction starts. While that transaction remains
+open, the listener cannot advance and retains pending notifications.
 
-## 3. Terminal B: llenar la cola
+## 3. Terminal B: Fill the Queue
 
 ```sh
 docker compose exec postgres psql -X -U postgres
@@ -38,75 +43,75 @@ docker compose exec postgres psql -X -U postgres
 
 ```sql
 SHOW max_notify_queue_pages;
-SELECT pg_notification_queue_usage() AS uso_inicial;
+SELECT pg_notification_queue_usage() AS initial_usage;
 
--- Cada sentencia generada se confirma por separado (autocommit).
--- Continuamos tras los errores esperados para poder medir la ocupación.
+-- Each generated statement commits separately (autocommit).
+-- Continue after expected errors so we can measure queue usage afterward.
 \set ON_ERROR_STOP off
 SELECT format('SELECT pg_notify(%L, %L);', 'demo', repeat('x', 7000) || g)
 FROM generate_series(1, 100) g
 \gexec
 
-SELECT round((100 * pg_notification_queue_usage())::numeric, 2) AS porcentaje;
+SELECT round((100 * pg_notification_queue_usage())::numeric, 2) AS usage_percent;
 ```
 
-Espera errores `too many notifications in the NOTIFY queue` y una ocupación
-alta. No tiene que marcar exactamente 100%: la asignación se realiza por páginas
-y segmentos. No envuelvas el envío en un único `BEGIN`: queremos conservar los
-envíos confirmados antes del primer fallo.
+Expect `too many notifications in the NOTIFY queue` errors and high queue usage.
+The measurement does not need to reach exactly 100%: allocation happens in pages
+and segments. Do not wrap the sends in a single `BEGIN`: we want successful sends
+to remain committed before the first failure.
 
-Opcional, desde otra terminal puedes ver los segmentos que respaldan la cola:
+Optionally, inspect the segments backing the queue from another terminal:
 
 ```sh
 docker compose exec postgres sh -c 'ls -lh "$PGDATA/pg_notify"'
 ```
 
-El tamaño de esos archivos no equivale exactamente a los bytes de mensajes
-pendientes; hay caché y asignación por segmentos.
+The file sizes do not exactly match the bytes of pending messages because of
+caching and segment allocation.
 
-## 4. Liberar y comprobar recuperación
+## 4. Release the Queue and Verify Recovery
 
-En la **terminal A**:
+In **terminal A**:
 
 ```sql
 COMMIT;
 ```
 
-`psql` imprimirá los mensajes pendientes, incluidos sus payloads grandes.
-Espera a que vuelva el prompt. En la **terminal B**:
+`psql` will print the pending notifications, including their large payloads.
+Wait for the prompt to return. In **terminal B**:
 
 ```sql
-SELECT pg_notification_queue_usage() AS uso_despues;
-SELECT pg_notify('demo', 'vuelve a funcionar');
+SELECT pg_notification_queue_usage() AS usage_after_commit;
+SELECT pg_notify('demo', 'it works again');
 ```
 
-La ocupación debe caer y el envío debe funcionar otra vez. Si la medición aún
-no baja, repítela unos instantes después: la limpieza no es instantánea.
+Queue usage should drop, and sending should work again. If the measurement has
+not dropped yet, query it again after a short delay: cleanup is not instantaneous.
 
-## 5. Limpiar
+## 5. Clean Up
 
-Sal de ambas sesiones con `\q` y elimina el contenedor y sus datos de prueba:
+Exit both sessions with `\q`, then remove the container and its test data:
 
 ```sh
 docker compose down -v
 ```
 
-## Qué demuestra
+## What This Demonstrates
 
-Un listener dentro de una transacción puede retener la cola; cuando se llena,
-las transacciones que envían notificaciones fallan al confirmar. Al terminar
-la transacción del listener, la cola puede liberarse y los envíos recuperarse.
+A listener inside a transaction can retain the queue. When the queue fills up,
+transactions sending notifications fail at commit. Ending the listener's
+transaction allows the queue to be released and notification delivery to recover.
 
-La cola es global para la instancia, aunque las notificaciones se entregan
-dentro de cada base de datos. Esta prueba usa una sola base: no demuestra por
-sí sola el efecto entre bases ni el antiguo cálculo del límite por wraparound.
-Tampoco es un límite de RAM: es una cola respaldada por `pg_notify/` con caché
-SLRU. Un cliente desconectado no retiene la cola ni recibe mensajes para
-reproducirlos al reconectarse.
+The queue is shared across the instance, although notifications are delivered
+within each database. This test uses one database: it does not independently
+demonstrate interference between databases or the historical wraparound limit.
+It is not a RAM limit either: the queue is backed by `pg_notify/` with an SLRU
+cache. A disconnected client does not retain the queue or receive missed messages
+for replay when it reconnects.
 
-En PostgreSQL 17 el límite predeterminado sigue siendo 8 GiB con páginas de
-8 KiB; ahora se configura mediante `max_notify_queue_pages`.
+In PostgreSQL 17, the default limit remains 8 GiB with 8 KiB pages; it is
+configurable through `max_notify_queue_pages`.
 
-Referencias oficiales: [NOTIFY](https://www.postgresql.org/docs/17/sql-notify.html),
+Official references: [NOTIFY](https://www.postgresql.org/docs/17/sql-notify.html),
 [max_notify_queue_pages](https://www.postgresql.org/docs/17/runtime-config-resource.html#GUC-MAX-NOTIFY-QUEUE-PAGES),
-[implementación de la cola](https://github.com/postgres/postgres/blob/REL_17_STABLE/src/backend/commands/async.c).
+and the [queue implementation](https://github.com/postgres/postgres/blob/REL_17_STABLE/src/backend/commands/async.c).
