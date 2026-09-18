@@ -1,4 +1,4 @@
-# PostgreSQL LISTEN/NOTIFY: A Minimal Queue Experiment
+# PostgreSQL LISTEN/NOTIFY: A Queue Experiment
 
 Watch PostgreSQL's notification queue fill up, reject new notifications, and
 recover once a listener ends its open transaction.
